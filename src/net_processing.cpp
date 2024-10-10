@@ -113,9 +113,6 @@ static const int MAX_BLOCKS_IN_TRANSIT_PER_PEER = 16;
 static constexpr auto BLOCK_STALLING_TIMEOUT_DEFAULT{2s};
 /** Maximum timeout for stalling block download. */
 static constexpr auto BLOCK_STALLING_TIMEOUT_MAX{64s};
-/** Number of headers sent in one getheaders result. We rely on the assumption that if a peer sends
- *  less than this number, we reached its tip. Changing this value is a protocol upgrade. */
-static const unsigned int MAX_HEADERS_RESULTS = 2000;
 /** Maximum depth of blocks we're willing to serve as compact blocks to peers
  *  when requested. For older blocks, a regular BLOCK response will be sent. */
 static const int MAX_CMPCTBLOCK_DEPTH = 5;
@@ -223,6 +220,9 @@ struct Peer {
     const ServiceFlags m_our_services;
     /** Services this peer offered to us. */
     std::atomic<ServiceFlags> m_their_services{NODE_NONE};
+
+    //! Whether this peer is an inbound connection
+    const bool m_is_inbound;
 
     /** Protects misbehavior data members */
     Mutex m_misbehavior_mutex;
@@ -394,9 +394,10 @@ struct Peer {
      * timestamp the peer sent in the version message. */
     std::atomic<std::chrono::seconds> m_time_offset{0s};
 
-    explicit Peer(NodeId id, ServiceFlags our_services)
+    explicit Peer(NodeId id, ServiceFlags our_services, bool is_inbound)
         : m_id{id}
         , m_our_services{our_services}
+        , m_is_inbound{is_inbound}
     {}
 
 private:
@@ -476,11 +477,6 @@ struct CNodeState {
 
     //! Time of last new block announcement
     int64_t m_last_block_announcement{0};
-
-    //! Whether this peer is an inbound connection
-    const bool m_is_inbound;
-
-    CNodeState(bool is_inbound) : m_is_inbound(is_inbound) {}
 };
 
 class PeerManagerImpl final : public PeerManager
@@ -519,6 +515,7 @@ public:
     std::optional<std::string> FetchBlock(NodeId peer_id, const CBlockIndex& block_index) override
         EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex);
     bool GetNodeStateStats(NodeId nodeid, CNodeStateStats& stats) const override EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex);
+    std::vector<TxOrphanage::OrphanTxBase> GetOrphanTransactions() override EXCLUSIVE_LOCKS_REQUIRED(!m_tx_download_mutex);
     PeerManagerInfo GetInfo() const override EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex);
     void SendPings() override EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex);
     void RelayTransaction(const uint256& txid, const uint256& wtxid) override EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex);
@@ -1015,7 +1012,7 @@ private:
     bool IsBlockRequested(const uint256& hash) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
     /** Have we requested this block from an outbound peer */
-    bool IsBlockRequestedFromOutbound(const uint256& hash) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+    bool IsBlockRequestedFromOutbound(const uint256& hash) EXCLUSIVE_LOCKS_REQUIRED(cs_main, !m_peer_mutex);
 
     /** Remove this block from our tracked requested blocks. Called if:
      *  - the block has been received from a peer
@@ -1099,7 +1096,7 @@ private:
      * lNodesAnnouncingHeaderAndIDs, and keeping that list under a certain size by
      * removing the first element if necessary.
      */
-    void MaybeSetPeerAsAnnouncingHeaderAndIDs(NodeId nodeid) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+    void MaybeSetPeerAsAnnouncingHeaderAndIDs(NodeId nodeid) EXCLUSIVE_LOCKS_REQUIRED(cs_main, !m_peer_mutex);
 
     /** Stack of nodes which we have set to announce using compact blocks */
     std::list<NodeId> lNodesAnnouncingHeaderAndIDs GUARDED_BY(cs_main);
@@ -1302,8 +1299,8 @@ bool PeerManagerImpl::IsBlockRequestedFromOutbound(const uint256& hash)
 {
     for (auto range = mapBlocksInFlight.equal_range(hash); range.first != range.second; range.first++) {
         auto [nodeid, block_it] = range.first->second;
-        CNodeState& nodestate = *Assert(State(nodeid));
-        if (!nodestate.m_is_inbound) return true;
+        PeerRef peer{GetPeerRef(nodeid)};
+        if (peer && !peer->m_is_inbound) return true;
     }
 
     return false;
@@ -1392,6 +1389,7 @@ void PeerManagerImpl::MaybeSetPeerAsAnnouncingHeaderAndIDs(NodeId nodeid)
     if (m_opts.ignore_incoming_txs) return;
 
     CNodeState* nodestate = State(nodeid);
+    PeerRef peer{GetPeerRef(nodeid)};
     if (!nodestate || !nodestate->m_provides_cmpctblocks) {
         // Don't request compact blocks if the peer has not signalled support
         return;
@@ -1404,15 +1402,15 @@ void PeerManagerImpl::MaybeSetPeerAsAnnouncingHeaderAndIDs(NodeId nodeid)
             lNodesAnnouncingHeaderAndIDs.push_back(nodeid);
             return;
         }
-        CNodeState *state = State(*it);
-        if (state != nullptr && !state->m_is_inbound) ++num_outbound_hb_peers;
+        PeerRef peer_ref{GetPeerRef(*it)};
+        if (peer_ref && !peer_ref->m_is_inbound) ++num_outbound_hb_peers;
     }
-    if (nodestate->m_is_inbound) {
+    if (peer && peer->m_is_inbound) {
         // If we're adding an inbound HB peer, make sure we're not removing
         // our last outbound HB peer in the process.
         if (lNodesAnnouncingHeaderAndIDs.size() >= 3 && num_outbound_hb_peers == 1) {
-            CNodeState *remove_node = State(lNodesAnnouncingHeaderAndIDs.front());
-            if (remove_node != nullptr && !remove_node->m_is_inbound) {
+            PeerRef remove_peer{GetPeerRef(lNodesAnnouncingHeaderAndIDs.front())};
+            if (remove_peer && !remove_peer->m_is_inbound) {
                 // Put the HB outbound peer in the second slot, so that it
                 // doesn't get removed.
                 std::swap(lNodesAnnouncingHeaderAndIDs.front(), *std::next(lNodesAnnouncingHeaderAndIDs.begin()));
@@ -1720,7 +1718,7 @@ void PeerManagerImpl::InitializeNode(const CNode& node, ServiceFlags our_service
     NodeId nodeid = node.GetId();
     {
         LOCK(cs_main); // For m_node_states
-        m_node_states.emplace_hint(m_node_states.end(), std::piecewise_construct, std::forward_as_tuple(nodeid), std::forward_as_tuple(node.IsInboundConn()));
+        m_node_states.try_emplace(m_node_states.end(), nodeid);
     }
     {
         LOCK(m_tx_download_mutex);
@@ -1731,7 +1729,7 @@ void PeerManagerImpl::InitializeNode(const CNode& node, ServiceFlags our_service
         our_services = static_cast<ServiceFlags>(our_services | NODE_BLOOM);
     }
 
-    PeerRef peer = std::make_shared<Peer>(nodeid, our_services);
+    PeerRef peer = std::make_shared<Peer>(nodeid, our_services, node.IsInboundConn());
     {
         LOCK(m_peer_mutex);
         m_peer_map.emplace_hint(m_peer_map.end(), nodeid, peer);
@@ -1920,6 +1918,12 @@ bool PeerManagerImpl::GetNodeStateStats(NodeId nodeid, CNodeStateStats& stats) c
     return true;
 }
 
+std::vector<TxOrphanage::OrphanTxBase> PeerManagerImpl::GetOrphanTransactions()
+{
+    LOCK(m_tx_download_mutex);
+    return m_orphanage.GetOrphanTransactions();
+}
+
 PeerManagerInfo PeerManagerImpl::GetInfo() const
 {
     return PeerManagerInfo{
@@ -1968,15 +1972,9 @@ void PeerManagerImpl::MaybePunishNodeForBlock(NodeId nodeid, const BlockValidati
         break;
     case BlockValidationResult::BLOCK_CACHED_INVALID:
         {
-            LOCK(cs_main);
-            CNodeState *node_state = State(nodeid);
-            if (node_state == nullptr) {
-                break;
-            }
-
             // Discourage outbound (but not inbound) peers if on an invalid chain.
             // Exempt HB compact block peers. Manual connections are always protected from discouragement.
-            if (!via_compact_block && !node_state->m_is_inbound) {
+            if (peer && !via_compact_block && !peer->m_is_inbound) {
                 if (peer) Misbehaving(*peer, message);
                 return;
             }
@@ -2786,7 +2784,7 @@ bool PeerManagerImpl::CheckHeadersAreContinuous(const std::vector<CBlockHeader>&
 bool PeerManagerImpl::IsContinuationOfLowWorkHeadersSync(Peer& peer, CNode& pfrom, std::vector<CBlockHeader>& headers)
 {
     if (peer.m_headers_sync) {
-        auto result = peer.m_headers_sync->ProcessNextHeaders(headers, headers.size() == MAX_HEADERS_RESULTS);
+        auto result = peer.m_headers_sync->ProcessNextHeaders(headers, headers.size() == m_opts.max_headers_result);
         // If it is a valid continuation, we should treat the existing getheaders request as responded to.
         if (result.success) peer.m_last_getheaders_timestamp = {};
         if (result.request_more) {
@@ -2880,7 +2878,7 @@ bool PeerManagerImpl::TryLowWorkHeadersSync(Peer& peer, CNode& pfrom, const CBlo
         // Only try to sync with this peer if their headers message was full;
         // otherwise they don't have more headers after this so no point in
         // trying to sync their too-little-work chain.
-        if (headers.size() == MAX_HEADERS_RESULTS) {
+        if (headers.size() == m_opts.max_headers_result) {
             // Note: we could advance to the last header in this set that is
             // known to us, rather than starting at the first header (which we
             // may already have); however this is unlikely to matter much since
@@ -3192,7 +3190,7 @@ void PeerManagerImpl::ProcessHeadersMessage(CNode& pfrom, Peer& peer,
     assert(pindexLast);
 
     // Consider fetching more headers if we are not using our headers-sync mechanism.
-    if (nCount == MAX_HEADERS_RESULTS && !have_headers_sync) {
+    if (nCount == m_opts.max_headers_result && !have_headers_sync) {
         // Headers message had its maximum size; the peer may have more headers.
         if (MaybeSendGetHeaders(pfrom, GetLocator(pindexLast), peer)) {
             LogDebug(BCLog::NET, "more getheaders (%d) to end to peer=%d (startheight:%d)\n",
@@ -3200,7 +3198,7 @@ void PeerManagerImpl::ProcessHeadersMessage(CNode& pfrom, Peer& peer,
         }
     }
 
-    UpdatePeerStateForReceivedHeaders(pfrom, peer, *pindexLast, received_new_header, nCount == MAX_HEADERS_RESULTS);
+    UpdatePeerStateForReceivedHeaders(pfrom, peer, *pindexLast, received_new_header, nCount == m_opts.max_headers_result);
 
     // Consider immediately downloading blocks.
     HeadersDirectFetchBlocks(pfrom, peer, *pindexLast);
@@ -4518,7 +4516,7 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
 
         // we must use CBlocks, as CBlockHeaders won't include the 0x00 nTx count at the end
         std::vector<CBlock> vHeaders;
-        int nLimit = MAX_HEADERS_RESULTS;
+        int nLimit = m_opts.max_headers_result;
         LogDebug(BCLog::NET, "getheaders %d to %s from peer=%d\n", (pindex ? pindex->nHeight : -1), hashStop.IsNull() ? "end" : hashStop.ToString(), pfrom.GetId());
         for (; pindex; pindex = m_chainman.ActiveChain().Next(pindex))
         {
@@ -5002,7 +5000,7 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
 
         // Bypass the normal CBlock deserialization, as we don't want to risk deserializing 2000 full blocks.
         unsigned int nCount = ReadCompactSize(vRecv);
-        if (nCount > MAX_HEADERS_RESULTS) {
+        if (nCount > m_opts.max_headers_result) {
             Misbehaving(*peer, strprintf("headers message size = %u", nCount));
             return;
         }

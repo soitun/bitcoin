@@ -3,7 +3,7 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#include <config/bitcoin-config.h> // IWYU pragma: keep
+#include <bitcoin-build-config.h> // IWYU pragma: keep
 
 #include <net.h>
 
@@ -12,6 +12,7 @@
 #include <banman.h>
 #include <clientversion.h>
 #include <common/args.h>
+#include <common/netif.h>
 #include <compat/compat.h>
 #include <consensus/consensus.h>
 #include <crypto/sha256.h>
@@ -1791,7 +1792,8 @@ void CConnman::CreateNodeFromAcceptedSocket(std::unique_ptr<Sock>&& sock,
     const bool inbound_onion = std::find(m_onion_binds.begin(), m_onion_binds.end(), addr_bind) != m_onion_binds.end();
     // The V2Transport transparently falls back to V1 behavior when an incoming V1 connection is
     // detected, so use it whenever we signal NODE_P2P_V2.
-    const bool use_v2transport(nLocalServices & NODE_P2P_V2);
+    ServiceFlags local_services = GetLocalServices();
+    const bool use_v2transport(local_services & NODE_P2P_V2);
 
     CNode* pnode = new CNode(id,
                              std::move(sock),
@@ -1809,7 +1811,7 @@ void CConnman::CreateNodeFromAcceptedSocket(std::unique_ptr<Sock>&& sock,
                                  .use_v2transport = use_v2transport,
                              });
     pnode->AddRef();
-    m_msgproc->InitializeNode(*pnode, nLocalServices);
+    m_msgproc->InitializeNode(*pnode, local_services);
     {
         LOCK(m_nodes_mutex);
         m_nodes.push_back(pnode);
@@ -2692,6 +2694,8 @@ void CConnman::ThreadOpenConnections(const std::vector<std::string> connect, Spa
 
         const auto current_time{NodeClock::now()};
         int nTries = 0;
+        const auto reachable_nets{g_reachable_nets.All()};
+
         while (!interruptNet)
         {
             if (anchor && !m_anchors.empty()) {
@@ -2723,7 +2727,7 @@ void CConnman::ThreadOpenConnections(const std::vector<std::string> connect, Spa
                 if (!addr.IsValid()) {
                     // No tried table collisions. Select a new table address
                     // for our feeler.
-                    std::tie(addr, addr_last_try) = addrman.Select(true);
+                    std::tie(addr, addr_last_try) = addrman.Select(true, reachable_nets);
                 } else if (AlreadyConnectedToAddress(addr)) {
                     // If test-before-evict logic would have us connect to a
                     // peer that we're already connected to, just mark that
@@ -2732,14 +2736,16 @@ void CConnman::ThreadOpenConnections(const std::vector<std::string> connect, Spa
                     // a currently-connected peer.
                     addrman.Good(addr);
                     // Select a new table address for our feeler instead.
-                    std::tie(addr, addr_last_try) = addrman.Select(true);
+                    std::tie(addr, addr_last_try) = addrman.Select(true, reachable_nets);
                 }
             } else {
                 // Not a feeler
                 // If preferred_net has a value set, pick an extra outbound
                 // peer from that network. The eviction logic in net_processing
                 // ensures that a peer from another network will be evicted.
-                std::tie(addr, addr_last_try) = addrman.Select(false, preferred_net);
+                std::tie(addr, addr_last_try) = preferred_net.has_value()
+                    ? addrman.Select(false, {*preferred_net})
+                    : addrman.Select(false, reachable_nets);
             }
 
             // Require outbound IPv4/IPv6 connections, other than feelers, to be to distinct network groups
@@ -2944,7 +2950,7 @@ void CConnman::OpenNetworkConnection(const CAddress& addrConnect, bool fCountFai
         return;
     pnode->grantOutbound = std::move(grant_outbound);
 
-    m_msgproc->InitializeNode(*pnode, nLocalServices);
+    m_msgproc->InitializeNode(*pnode, m_local_services);
     {
         LOCK(m_nodes_mutex);
         m_nodes.push_back(pnode);
@@ -3113,46 +3119,10 @@ void Discover()
     if (!fDiscover)
         return;
 
-#ifdef WIN32
-    // Get local host IP
-    char pszHostName[256] = "";
-    if (gethostname(pszHostName, sizeof(pszHostName)) != SOCKET_ERROR)
-    {
-        const std::vector<CNetAddr> addresses{LookupHost(pszHostName, 0, true)};
-        for (const CNetAddr& addr : addresses)
-        {
-            if (AddLocal(addr, LOCAL_IF))
-                LogPrintf("%s: %s - %s\n", __func__, pszHostName, addr.ToStringAddr());
-        }
+    for (const CNetAddr &addr: GetLocalAddresses()) {
+        if (AddLocal(addr, LOCAL_IF))
+            LogPrintf("%s: %s\n", __func__, addr.ToStringAddr());
     }
-#elif (HAVE_DECL_GETIFADDRS && HAVE_DECL_FREEIFADDRS)
-    // Get local host ip
-    struct ifaddrs* myaddrs;
-    if (getifaddrs(&myaddrs) == 0)
-    {
-        for (struct ifaddrs* ifa = myaddrs; ifa != nullptr; ifa = ifa->ifa_next)
-        {
-            if (ifa->ifa_addr == nullptr) continue;
-            if ((ifa->ifa_flags & IFF_UP) == 0) continue;
-            if ((ifa->ifa_flags & IFF_LOOPBACK) != 0) continue;
-            if (ifa->ifa_addr->sa_family == AF_INET)
-            {
-                struct sockaddr_in* s4 = (struct sockaddr_in*)(ifa->ifa_addr);
-                CNetAddr addr(s4->sin_addr);
-                if (AddLocal(addr, LOCAL_IF))
-                    LogPrintf("%s: IPv4 %s: %s\n", __func__, ifa->ifa_name, addr.ToStringAddr());
-            }
-            else if (ifa->ifa_addr->sa_family == AF_INET6)
-            {
-                struct sockaddr_in6* s6 = (struct sockaddr_in6*)(ifa->ifa_addr);
-                CNetAddr addr(s6->sin6_addr);
-                if (AddLocal(addr, LOCAL_IF))
-                    LogPrintf("%s: IPv6 %s: %s\n", __func__, ifa->ifa_name, addr.ToStringAddr());
-            }
-        }
-        freeifaddrs(myaddrs);
-    }
-#endif
 }
 
 void CConnman::SetNetworkActive(bool active)
@@ -3741,7 +3711,7 @@ uint64_t CConnman::GetTotalBytesSent() const
 
 ServiceFlags CConnman::GetLocalServices() const
 {
-    return nLocalServices;
+    return m_local_services;
 }
 
 static std::unique_ptr<Transport> MakeTransport(NodeId id, bool use_v2transport, bool inbound) noexcept

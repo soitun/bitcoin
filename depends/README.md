@@ -41,7 +41,7 @@ The paths are automatically configured and no other options are needed.
 
 #### Common
 
-    apt install automake bison cmake curl libtool make patch pkg-config python3 xz-utils
+    apt install bison cmake curl make patch pkg-config python3 xz-utils
 
 #### For macOS cross compilation
 
@@ -113,9 +113,8 @@ The following can be set when running make: `make FOO=bar`
 - `NO_BDB`: Don't download/build/cache BerkeleyDB
 - `NO_SQLITE`: Don't download/build/cache SQLite
 - `NO_UPNP`: Don't download/build/cache packages needed for enabling UPnP
-- `NO_NATPMP`: Don't download/build/cache packages needed for enabling NAT-PMP
 - `NO_USDT`: Don't download/build/cache packages needed for enabling USDT tracepoints
-- `MULTIPROCESS`: Build libmultiprocess (experimental, requires CMake)
+- `MULTIPROCESS`: Build libmultiprocess (experimental)
 - `DEBUG`: Disable some optimizations and enable more runtime checking
 - `HOST_ID_SALT`: Optional salt to use when generating host package ids
 - `BUILD_ID_SALT`: Optional salt to use when generating build package ids

@@ -3,7 +3,7 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#include <config/bitcoin-config.h> // IWYU pragma: keep
+#include <bitcoin-build-config.h> // IWYU pragma: keep
 
 #include <netbase.h>
 
@@ -230,7 +230,7 @@ CService LookupNumeric(const std::string& name, uint16_t portDefault, DNSLookupF
 bool IsUnixSocketPath(const std::string& name)
 {
 #ifdef HAVE_SOCKADDR_UN
-    if (name.find(ADDR_PREFIX_UNIX) != 0) return false;
+    if (!name.starts_with(ADDR_PREFIX_UNIX)) return false;
 
     // Split off "unix:" prefix
     std::string str{name.substr(ADDR_PREFIX_UNIX.length())};
@@ -557,7 +557,8 @@ std::unique_ptr<Sock> CreateSockOS(int domain, int type, int protocol)
 std::function<std::unique_ptr<Sock>(int, int, int)> CreateSock = CreateSockOS;
 
 template<typename... Args>
-static void LogConnectFailure(bool manual_connection, const char* fmt, const Args&... args) {
+static void LogConnectFailure(bool manual_connection, util::ConstevalFormatString<sizeof...(Args)> fmt, const Args&... args)
+{
     std::string error_message = tfm::format(fmt, args...);
     if (manual_connection) {
         LogPrintf("%s\n", error_message);
